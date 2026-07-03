@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Approach Watch — Boston</title>
+<style>
+  :root{
+    --bg: #06110d;
+    --panel: #0b1d16;
+    --line: #163526;
+    --green: #35f2a3;
+    --green-dim: #1f8f63;
+    --amber: #ffb545;
+    --red: #ff3b3b;
+    --text: #d9f5e8;
+    --text-dim: #6f9c8a;
+    --mono: 'JetBrains Mono','Courier New',ui-monospace,monospace;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--mono);}
+  body{min-height:100vh;padding:20px;}
+
+  .wrap{max-width:920px;margin:0 auto;}
+
+  header{display:flex;justify-content:space-between;align-items:flex-end;border-bottom:1px solid var(--line);padding-bottom:14px;margin-bottom:16px;}
+  header h1{font-size:18px;letter-spacing:.08em;margin:0;color:var(--green);text-transform:uppercase;}
+  header .sub{font-size:11px;color:var(--text-dim);margin-top:4px;letter-spacing:.05em;}
+  header .coords{text-align:right;font-size:11px;color:var(--text-dim);line-height:1.6;}
+  header .coords b{color:var(--green-dim);}
+
+  .status-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
+  .stat{background:var(--panel);border:1px solid var(--line);padding:10px 12px;}
+  .stat .label{font-size:10px;color:var(--text-dim);letter-spacing:.08em;text-transform:uppercase;}
+  .stat .value{font-size:18px;color:var(--green);margin-top:4px;}
+  .stat .value.warn{color:var(--amber);}
+  .stat .value.err{color:var(--red);}
+
+  #banner{display:none;background:var(--red);color:#1a0000;padding:18px 20px;margin-bottom:16px;
+    font-size:15px;font-weight:700;letter-spacing:.03em;text-align:center;
+    animation:flash 0.9s steps(2) infinite;border:1px solid #ff8080;}
+  #banner .detail{display:block;font-weight:400;font-size:12px;margin-top:6px;font-family:var(--mono);}
+  @keyframes flash{50%{background:#4a0000;color:var(--red);}}
+
+  .controls{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;}
+  button{font-family:var(--mono);background:var(--panel);color:var(--text);border:1px solid var(--line);
+    padding:9px 14px;font-size:12px;letter-spacing:.05em;cursor:pointer;text-transform:uppercase;}
+  button:hover{border-color:var(--green-dim);color:var(--green);}
+  button.primary{border-color:var(--green-dim);color:var(--green);}
+  button.muted{opacity:.55;}
+  button.danger{border-color:#7a2222;color:var(--red);}
+
+  table{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:20px;}
+  thead th{text-align:left;color:var(--text-dim);font-weight:400;font-size:10px;letter-spacing:.08em;
+    text-transform:uppercase;border-bottom:1px solid var(--line);padding:6px 8px;}
+  tbody td{padding:7px 8px;border-bottom:1px solid var(--line);}
+  tbody tr.match{color:var(--amber);}
+  tbody tr.match td:first-child{color:var(--red);}
+  .empty-row td{color:var(--text-dim);text-align:center;padding:18px;}
+
+  h2{font-size:12px;letter-spacing:.08em;color:var(--text-dim);text-transform:uppercase;
+    border-bottom:1px solid var(--line);padding-bottom:6px;margin:24px 0 10px;}
+
+  #log{font-size:11px;color:var(--text-dim);max-height:180px;overflow-y:auto;}
+  #log div{padding:3px 0;border-bottom:1px solid var(--line);}
+  #log div b{color:var(--amber);}
+
+  footer{margin-top:24px;font-size:10px;color:var(--text-dim);line-height:1.7;border-top:1px solid var(--line);padding-top:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>Approach Watch</h1>
+      <div class="sub">standalone · adsb.lol · this tab only</div>
+    </div>
+    <div class="coords">
+      <div><b id="coords-display">42.216748, -70.739083</b></div>
+      <div>radius 1.85 nm · alt &lt; 4500 ft</div>
+    </div>
+  </header>
+
+  <div class="status-row">
+    <div class="stat"><div class="label">Feed</div><div class="value" id="stat-feed">connecting…</div></div>
+    <div class="stat"><div class="label">Last poll</div><div class="value" id="stat-time">—</div></div>
+    <div class="stat"><div class="label">In radius</div><div class="value" id="stat-total">0</div></div>
+    <div class="stat"><div class="label">Matching filter</div><div class="value" id="stat-match">0</div></div>
+  </div>
+
+  <div id="banner"><span id="banner-text">TRAFFIC</span><span class="detail" id="banner-detail"></span></div>
+
+  <div class="controls">
+    <button class="primary" id="btn-notify">Enable Mac/Windows notifications</button>
+    <button id="btn-mute">Mute alarm</button>
+    <button id="btn-test">Test alarm</button>
+    <button class="danger" id="btn-stop">Stop watching</button>
+  </div>
+
+  <div class="controls" id="coords-form">
+    <span style="font-size:11px;color:var(--text-dim);letter-spacing:.05em;text-transform:uppercase;align-self:center;">Change lat/long from default</span>
+    <input type="text" id="input-lat" value="42.21674795767772" style="font-family:var(--mono);background:var(--panel);color:var(--text);border:1px solid var(--line);padding:8px 10px;font-size:12px;width:150px;">
+    <input type="text" id="input-lon" value="-70.7390828673531" style="font-family:var(--mono);background:var(--panel);color:var(--text);border:1px solid var(--line);padding:8px 10px;font-size:12px;width:150px;">
+    <button class="primary" id="btn-apply-coords">Apply</button>
+  </div>
+
+  <h2>Matching now</h2>
+  <table>
+    <thead><tr><th>Callsign</th><th>Type</th><th>Alt (ft)</th><th>GS (kt)</th><th>Dist (nm)</th><th>Track</th></tr></thead>
+    <tbody id="table-body"><tr class="empty-row"><td colspan="6">no traffic yet</td></tr></tbody>
+  </table>
+
+  <h2>Alert log (this session)</h2>
+  <div id="log"><div>waiting for first poll…</div></div>
+
+  <footer>
+    Polls adsb.lol every 8s for the fixed point above. Allow-list only: triggers on military aircraft of any kind,
+    plus civilian narrowbody/widebody jets (Airbus A3xx, Boeing 7xx, MD-80/90/11, DC-8/9/10, L-1011, IL-96, A220)
+    under 4500 ft. Business jets, regional jets/turboprops, and piston GA never trigger. Each new contact rings the
+    alarm twice, then stays silent until the next new contact. Closing this tab, sleeping the laptop, or losing wifi
+    stops everything — nothing runs server-side or persists.
+  </footer>
+
+</div>
+
+<script>
+let LAT = 42.21674795767772;
+let LON = -70.7390828673531;
+const RADIUS_NM = 1.85;
+const MAX_ALT_FT = 4500;
+const POLL_MS = 8000;
+
+// UPDATED: now rings 3 times per alert
+const RING_COUNT = 3;
+const RING_GAP_MS = 1400;
+
+const AIRLINER_TYPE_PREFIXES = ['A3','B7','BCS','MD8','MD9','MD11','DC8','DC9','DC10','L101','IL96'];
+
+const MILITARY_TYPE_PREFIXES = [
+  'C17','C5M','C130','K35','K46','KC13','KC30','KC10','E3TF','E4B','VC25','C40','C37','C21',
+  'P8','P3','B52','B1','B2','F15','F16','F18','F22','F35','A10','U2','RC135','WC135','OC135',
+  'TC135','UH60','CH47','CH53','MV22','C160','A400','C-130'
+];
+const MILITARY_KEYWORDS = ['USAF','US ARMY','US NAVY','USMC','MARINE','NAVY','ARMY','AIR FORCE','COAST GUARD','RAF','NATO','MILITARY'];
+
+function isMilitary(a){
+  if (typeof a.dbFlags === 'number' && (a.dbFlags & 1) === 1) return true;
+  const t = (a.t || '').toUpperCase();
+  if (MILITARY_TYPE_PREFIXES.some(p => t.startsWith(p))) return true;
+  const desc = ((a.desc||'') + ' ' + (a.flight||'') + ' ' + (a.ownOp||'')).toUpperCase();
+  return MILITARY_KEYWORDS.some(k => desc.includes(k));
+}
+function isAirlinerBody(a){
+  const t = (a.t || '').toUpperCase();
+  return AIRLINER_TYPE_PREFIXES.some(p => t.startsWith(p));
+}
+
+function apiUrl(){
+  return `https://api.adsb.lol/v2/point/${LAT}/${LON}/${RADIUS_NM}`;
+}
+
+let audioCtx = null;
+let alarmTimer = null;
+let muted = false;
+let watching = true;
+let knownMatchHexes = new Set();
+
+const el = id => document.getElementById(id);
+const statFeed = el('stat-feed'), statTime = el('stat-time'), statTotal = el('stat-total'),
+      statMatch = el('stat-match'), banner = el('banner'), bannerText = el('banner-text'),
+      bannerDetail = el('banner-detail'), tbody = el('table-body'), log = el('log');
+
+function haversineNm(lat1, lon1, lat2, lon2){
+  const R = 3440.065;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2-lat1), dLon = toRad(lon2-lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(1-a), Math.sqrt(a));
+}
+
+function logLine(text, strong){
+  const t = new Date().toLocaleTimeString();
+  const div = document.createElement('div');
+  div.innerHTML = `${t} — ${strong ? '<b>'+text+'</b>' : text}`;
+  log.prepend(div);
+  while(log.children.length > 60) log.removeChild(log.lastChild);
+}
+
+// --- Audio alarm ---
+function ensureAudio(){
+  if(!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function tone(freq, dur, offset){
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  osc.frequency.value = freq;
+  gain.gain.value = 0.0001;
+  osc.connect(gain).connect(audioCtx.destination);
+  const t = audioCtx.currentTime + offset;
+  gain.gain.exponentialRampToValueAtTime(0.3, t + 0.015);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.start(t);
+  osc.stop(t + dur + 0.02);
+}
+function beep(){
+  ensureAudio();
+  tone(1000, 0.12, 0);
+  tone(1000, 0.12, 0.22);
+  tone(1000, 0.55, 0.44);
+}
+
+function ringAlarm(){
+  if(muted) return;
+  let count = 0;
+  function ringOnce(){
+    if(muted) return;
+    beep();
+    count++;
+    if(count < RING_COUNT){
+      alarmTimer = setTimeout(ringOnce, RING_GAP_MS);
+    }
+  }
+  ringOnce();
+}
+
+function stopAlarm(){
+  clearTimeout(alarmTimer);
+  alarmTimer = null;
+}
+
+// --- Notifications ---
+function requestNotify(){
+  if(!('Notification' in window)){ alert('Notifications not supported in this browser.'); return; }
+  Notification.requestPermission().then(p=>{
+    el('btn-notify').textContent = p === 'granted' ? 'Notifications enabled' : 'Notifications blocked';
+  });
+}
+function fireNotification(title, body){
+  if('Notification' in window && Notification.permission === 'granted'){
+    new Notification(title, { body, tag: title });
+  }
+}
+
+// --- Poll loop ---
+async function poll(){
+  if(!watching) return;
+  try{
+    const res = await fetch(apiUrl());
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json();
+    const ac = data.ac || [];
+
+    statFeed.textContent = 'ok';
+    statFeed.className = 'value';
+    statTime.textContent = new Date().toLocaleTimeString();
+    statTotal.textContent = ac.length;
+
+    const enriched = ac.map(a=>{
+      const alt = typeof a.alt_baro === 'number' ? a.alt_baro : null;
+      const dist = (a.lat && a.lon) ? haversineNm(LAT, LON, a.lat, a.lon) : null;
+      return {...a, _alt: alt, _dist: dist};
+    });
+
+    const matches = enriched.filter(a =>
+      a._alt !== null && a._alt < MAX_ALT_FT && (isMilitary(a) || isAirlinerBody(a))
+    ).sort((x,y)=> (x._dist ?? 99) - (y._dist ?? 99));
+
+    statMatch.textContent = matches.length;
+    statMatch.className = matches.length ? 'value warn' : 'value';
+
+    renderTable(matches);
+    handleAlerting(matches);
+
+  }catch(err){
+    statFeed.textContent = 'error';
+    statFeed.className = 'value err';
+    logLine('feed error: '+err.message, false);
+  }
+}
+
+function renderTable(matches){
+  tbody.innerHTML = '';
+  if(matches.length === 0){
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">no matching traffic right now</td></tr>';
+    return;
+  }
+  for(const a of matches){
+    const tr = document.createElement('tr');
+    tr.className = 'match';
+    tr.innerHTML = `
+      <td>${a.flight ? a.flight.trim() : (a.r || a.hex || '—')}</td>
+      <td>${a.desc || a.t || '—'}</td>
+      <td>${a._alt ?? '—'}</td>
+      <td>${a.gs ?? '—'}</td>
+      <td>${a._dist !== null ? a._dist.toFixed(2) : '—'}</td>
+      <td>${a.track !== undefined ? Math.round(a.track)+'°' : '—'}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function handleAlerting(matches){
+  const currentHexes = new Set(matches.map(a=>a.hex));
+  const newOnes = matches.filter(a => !knownMatchHexes.has(a.hex));
+
+  if(matches.length > 0){
+    banner.style.display = 'block';
+    bannerText.textContent = `TRAFFIC — ${matches.length} AIRCRAFT`;
+    bannerDetail.textContent = matches.map(a =>
+      `${(a.flight||a.r||a.hex).trim()} · ${a.desc||a.t||'?'} · ${a._alt}ft`
+    ).join('   ');
+  }else{
+    banner.style.display = 'none';
+  }
+
+  for(const a of newOnes){
+    const label = `${(a.flight||a.r||a.hex).trim()} — ${a.desc||a.t||'unknown type'} — ${a._alt}ft`;
+    logLine(label, true);
+    fireNotification('Traffic near you', label);
+  }
+
+  if(newOnes.length > 0){
+    ringAlarm();
+  }
+
+  knownMatchHexes = currentHexes;
+}
+
+// --- Controls ---
+el('btn-notify').addEventListener('click', requestNotify);
+el('btn-test').addEventListener('click', ()=>{
+  ensureAudio();
+  beep();
+  fireNotification('Test alert','This is a test notification.');
+});
+el('btn-mute').addEventListener('click', ()=>{
+  muted = !muted;
+  el('btn-mute').textContent = muted ? 'Unmute alarm' : 'Mute alarm';
+  el('btn-mute').classList.toggle('muted', muted);
+  if(muted) stopAlarm();
+});
+el('btn-stop').addEventListener('click', ()=>{
+  watching = false;
+  stopAlarm();
+  statFeed.textContent = 'stopped';
+  logLine('watch stopped by user', false);
+});
+el('btn-apply-coords').addEventListener('click', ()=>{
+  const newLat = parseFloat(el('input-lat').value);
+  const newLon = parseFloat(el('input-lon').value);
+  if(Number.isNaN(newLat) || Number.isNaN(newLon) ||
+     newLat < -90 || newLat > 90 || newLon < -180 || newLon > 180){
+    alert('Enter valid lat (-90 to 90) and long (-180 to 180) values.');
+    return;
+  }
+  LAT = newLat;
+  LON = newLon;
+  el('coords-display').textContent = `${LAT.toFixed(6)}, ${LON.toFixed(6)}`;
+  knownMatchHexes = new Set();
+  logLine(`location changed to ${LAT.toFixed(5)}, ${LON.toFixed(5)}`, false);
+  poll();
+});
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
