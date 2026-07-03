@@ -119,7 +119,8 @@
   <div id="log"><div>waiting for first poll…</div></div>
 
   <footer>
-    Polls adsb.lol every 8s for the fixed point above (backs off automatically on errors — see status panel).
+    Polls adsb.lol every ~15s for the fixed point above, with jittered exponential backoff (up to 10 min)
+    on errors — see status panel for current interval.
     Allow-list only: triggers on military aircraft of any kind, plus civilian narrowbody/widebody jets
     (Airbus A3xx, Boeing 7xx, MD-80/90/11, DC-8/9/10, L-1011, IL-96, A220) under 4500 ft. Business jets,
     regional jets/turboprops, and piston GA never trigger. Each new contact rings the alarm twice, then stays
@@ -152,11 +153,32 @@ const MAX_ALT_FT = 4500;
 // rapid page reloads during testing), we back off exponentially on
 // consecutive errors and reset to the base interval as soon as a request
 // succeeds again.
-const POLL_MS = 8000;          // base interval when healthy
-const MAX_POLL_MS = 120000;    // cap backoff at 2 minutes
+// adsb.lol's own docs: "Rate limits are dynamic based on the environment
+// load" — there is no fixed number to stay under, and no API key exists to
+// raise it. That means backoff has to be open-ended, not just "double up to
+// a small cap and keep trying forever at that cap." Two changes from the
+// last version:
+//   1. Base interval raised from 8s to 15s. Approach traffic doesn't change
+//      fast enough to need sub-15s polling, and this alone roughly halves
+//      request volume.
+//   2. A circuit breaker: after a run of consecutive failures, instead of
+//      settling into a steady "hit it every 2 minutes forever" pattern
+//      (which is still a sustained load pattern that can keep tripping a
+//      load-based limit), we back off exponentially with a much higher
+//      ceiling (10 min) AND jitter every delay so this tab's requests don't
+//      land on a suspiciously exact rhythm.
+const POLL_MS = 15000;          // base interval when healthy
+const MAX_POLL_MS = 600000;     // cap backoff at 10 minutes
 const BACKOFF_MULTIPLIER = 2;
+const JITTER_FRACTION = 0.25;   // +/-25% randomness on every scheduled delay
 let currentPollDelay = POLL_MS;
 let pollTimer = null;
+let requestInFlight = false;    // guard against overlapping fetches
+
+function withJitter(ms){
+  const spread = ms * JITTER_FRACTION;
+  return Math.round(ms + (Math.random() * 2 - 1) * spread);
+}
 
 const RING_COUNT = 3;
 const RING_GAP_MS = 1400;
@@ -280,6 +302,11 @@ function fireNotification(title, body){
 // --- Poll loop ---
 async function poll(){
   if(!watching) return;
+  if(requestInFlight){
+    logLine('skipped a poll — previous request still in flight', false, null);
+    return;
+  }
+  requestInFlight = true;
   try{
     const res = await fetch(apiUrl(), {
       method: 'GET',
@@ -301,12 +328,14 @@ async function poll(){
     const data = await res.json();
     const ac = data.ac || [];
 
-    // Success: clear the error streak and drop back to the base poll rate.
+    // Success: clear the error streak and drop back to the base poll rate
+    // (still jittered — a perfectly steady rhythm is itself a pattern that
+    // load-based limiters can flag).
     if (consecutiveErrors > 0) {
-      logLine(`feed recovered after ${consecutiveErrors} failed poll(s), back to ${POLL_MS/1000}s interval`, false, null);
+      logLine(`feed recovered after ${consecutiveErrors} failed poll(s), back to ~${POLL_MS/1000}s interval`, false, null);
     }
     consecutiveErrors = 0;
-    currentPollDelay = POLL_MS;
+    currentPollDelay = withJitter(POLL_MS);
 
     statFeed.textContent = 'ok';
     statFeed.className = 'value';
@@ -334,12 +363,16 @@ async function poll(){
   }catch(err){
     consecutiveErrors++;
 
-    // Exponential backoff: 8s, 16s, 32s, 64s, then capped at 120s.
-    currentPollDelay = Math.min(MAX_POLL_MS, POLL_MS * Math.pow(BACKOFF_MULTIPLIER, consecutiveErrors));
+    // Exponential backoff: ~15s, 30s, 60s, 2min, 4min, 8min, capped at 10min.
+    // Jittered so a stuck feed doesn't retry on a perfectly predictable beat.
+    const rawDelay = Math.min(MAX_POLL_MS, POLL_MS * Math.pow(BACKOFF_MULTIPLIER, consecutiveErrors));
+    currentPollDelay = withJitter(rawDelay);
 
     statFeed.textContent = 'error';
     statFeed.className = 'value err';
-    statFeedSub.textContent = `retry in ${Math.round(currentPollDelay/1000)}s (${consecutiveErrors} in a row)`;
+    const mins = currentPollDelay >= 60000;
+    const retryStr = mins ? `${(currentPollDelay/60000).toFixed(1)}min` : `${Math.round(currentPollDelay/1000)}s`;
+    statFeedSub.textContent = `retry in ${retryStr} (${consecutiveErrors} in a row)`;
 
     // A TypeError from fetch() means the request never yielded a readable
     // response: CORS block, DNS failure, offline, or an ad-blocker eating it.
@@ -354,14 +387,14 @@ async function poll(){
     if (err instanceof TypeError) {
       isRateLimitLikely = true;
       reason = 'Request blocked before a response could be read (TypeError). On adsb.lol this most often means ' +
-        'you are being rate-limited (HTTP 429) — the server only sends CORS headers on successful responses, so ' +
-        'a 429 looks identical to a CORS/offline failure from inside JS. Check DevTools → Network tab: if the ' +
-        'failed request to api.adsb.lol shows status 429, that confirms it. Could also be offline, DNS failure, ' +
-        'or an ad-blocker/privacy extension — check those if this persists after backing off. ' +
-        `Backing off to ${Math.round(currentPollDelay/1000)}s before the next attempt.`;
+        'you are being rate-limited — the server only sends CORS headers on successful responses, so a 429 ' +
+        'looks identical to a CORS/offline failure from inside JS, and adsb.lol\'s limit is dynamic (based on ' +
+        'server load, not a fixed number), so it can recur even if you\'re polling politely. Check DevTools → ' +
+        'Network tab if you want to confirm the status code. Could also be offline, DNS failure, or an ad-blocker ' +
+        `— worth checking if this doesn't clear on its own. Next attempt in ${retryStr}.`;
     } else {
       isRateLimitLikely = /429|too many/i.test(err.message);
-      reason = err.message + ` — backing off to ${Math.round(currentPollDelay/1000)}s before the next attempt.`;
+      reason = err.message + ` — next attempt in ${retryStr}.`;
     }
 
     logLine('feed error: ' + reason, true, isRateLimitLikely ? 'rate' : 'err');
@@ -369,9 +402,13 @@ async function poll(){
     if (consecutiveErrors >= 3) {
       banner.classList.add('info');
       banner.style.display = 'block';
-      bannerText.textContent = isRateLimitLikely ? 'FEED ERROR — LIKELY RATE-LIMITED (429)' : 'FEED ERROR';
+      bannerText.textContent = isRateLimitLikely
+        ? `FEED BACKING OFF — LIKELY RATE-LIMITED (retry in ${retryStr})`
+        : `FEED ERROR (retry in ${retryStr})`;
       bannerDetail.textContent = reason;
     }
+  } finally {
+    requestInFlight = false;
   }
 }
 
@@ -456,7 +493,7 @@ el('btn-apply-coords').addEventListener('click', ()=>{
   el('coords-display').textContent = `${LAT.toFixed(6)}, ${LON.toFixed(6)}`;
   knownMatchHexes = new Set();
   consecutiveErrors = 0;
-  currentPollDelay = POLL_MS;
+  currentPollDelay = withJitter(POLL_MS);
   logLine(`location changed to ${LAT.toFixed(5)}, ${LON.toFixed(5)}`, false, null);
   clearTimeout(pollTimer);
   runLoop();
