@@ -34,6 +34,7 @@
   .stat .value{font-size:18px;color:var(--green);margin-top:4px;}
   .stat .value.warn{color:var(--amber);}
   .stat .value.err{color:var(--red);}
+  .stat .sublabel{font-size:10px;color:var(--text-dim);margin-top:2px;}
 
   #banner{display:none;background:var(--red);color:#1a0000;padding:18px 20px;margin-bottom:16px;
     font-size:15px;font-weight:700;letter-spacing:.03em;text-align:center;
@@ -66,6 +67,7 @@
   #log div{padding:3px 0;border-bottom:1px solid var(--line);}
   #log div b{color:var(--amber);}
   #log div.err b{color:var(--red);}
+  #log div.rate b{color:#ff8a3d;}
 
   footer{margin-top:24px;font-size:10px;color:var(--text-dim);line-height:1.7;border-top:1px solid var(--line);padding-top:12px;}
 </style>
@@ -85,7 +87,7 @@
   </header>
 
   <div class="status-row">
-    <div class="stat"><div class="label">Feed</div><div class="value" id="stat-feed">connecting…</div></div>
+    <div class="stat"><div class="label">Feed</div><div class="value" id="stat-feed">connecting…</div><div class="sublabel" id="stat-feed-sub"></div></div>
     <div class="stat"><div class="label">Last poll</div><div class="value" id="stat-time">—</div></div>
     <div class="stat"><div class="label">In radius</div><div class="value" id="stat-total">0</div></div>
     <div class="stat"><div class="label">Matching filter</div><div class="value" id="stat-match">0</div></div>
@@ -117,11 +119,12 @@
   <div id="log"><div>waiting for first poll…</div></div>
 
   <footer>
-    Polls adsb.lol every 8s for the fixed point above. Allow-list only: triggers on military aircraft of any kind,
-    plus civilian narrowbody/widebody jets (Airbus A3xx, Boeing 7xx, MD-80/90/11, DC-8/9/10, L-1011, IL-96, A220)
-    under 4500 ft. Business jets, regional jets/turboprops, and piston GA never trigger. Each new contact rings the
-    alarm twice, then stays silent until the next new contact. Closing this tab, sleeping the laptop, or losing wifi
-    stops everything — nothing runs server-side or persists.
+    Polls adsb.lol every 8s for the fixed point above (backs off automatically on errors — see status panel).
+    Allow-list only: triggers on military aircraft of any kind, plus civilian narrowbody/widebody jets
+    (Airbus A3xx, Boeing 7xx, MD-80/90/11, DC-8/9/10, L-1011, IL-96, A220) under 4500 ft. Business jets,
+    regional jets/turboprops, and piston GA never trigger. Each new contact rings the alarm twice, then stays
+    silent until the next new contact. Closing this tab, sleeping the laptop, or losing wifi stops everything —
+    nothing runs server-side or persists.
   </footer>
 
 </div>
@@ -137,7 +140,23 @@ let LON = -70.7390828673531;
 let RADIUS_NM = 2;
 
 const MAX_ALT_FT = 4500;
-const POLL_MS = 8000;
+
+// --- Polling / backoff ---
+// adsb.lol rate-limits per IP. Because it only attaches CORS headers to
+// successful (200) responses, a 429 response never reaches fetch()'s .then()
+// at all — the browser blocks it as an opaque "network error" (a TypeError)
+// before your code can even see the status code. DevTools' Network tab can
+// still show you the real 429 on the wire, but JS can't. So instead of
+// hammering the API on a fixed 8s timer regardless of failures (which is
+// exactly what trips the rate limit in the first place, especially with
+// rapid page reloads during testing), we back off exponentially on
+// consecutive errors and reset to the base interval as soon as a request
+// succeeds again.
+const POLL_MS = 8000;          // base interval when healthy
+const MAX_POLL_MS = 120000;    // cap backoff at 2 minutes
+const BACKOFF_MULTIPLIER = 2;
+let currentPollDelay = POLL_MS;
+let pollTimer = null;
 
 const RING_COUNT = 3;
 const RING_GAP_MS = 1400;
@@ -178,7 +197,7 @@ let knownMatchHexes = new Set();
 let consecutiveErrors = 0;
 
 const el = id => document.getElementById(id);
-const statFeed = el('stat-feed'), statTime = el('stat-time'), statTotal = el('stat-total'),
+const statFeed = el('stat-feed'), statFeedSub = el('stat-feed-sub'), statTime = el('stat-time'), statTotal = el('stat-total'),
       statMatch = el('stat-match'), banner = el('banner'), bannerText = el('banner-text'),
       bannerDetail = el('banner-detail'), tbody = el('table-body'), log = el('log');
 
@@ -192,10 +211,11 @@ function haversineNm(lat1, lon1, lat2, lon2){
   return R * 2 * Math.atan2(Math.sqrt(1-a), Math.sqrt(a));
 }
 
-function logLine(text, strong, isError){
+function logLine(text, strong, kind){
+  // kind: null (normal), 'err' (real error), 'rate' (likely rate-limit)
   const t = new Date().toLocaleTimeString();
   const div = document.createElement('div');
-  if (isError) div.className = 'err';
+  if (kind) div.className = kind;
   div.innerHTML = `${t} — ${strong ? '<b>'+text+'</b>' : text}`;
   log.prepend(div);
   while(log.children.length > 60) log.removeChild(log.lastChild);
@@ -270,7 +290,9 @@ async function poll(){
     if(!res.ok){
       // Surface the actual HTTP status + body instead of a generic error,
       // so a 422 (bad params), 429 (rate limited), or 5xx (server issue)
-      // are all distinguishable at a glance.
+      // are all distinguishable at a glance. We only get here for statuses
+      // that DID come with CORS headers, since anything without them
+      // (adsb.lol's 429s) never reaches this point — see the catch block.
       let bodySnippet = '';
       try { bodySnippet = (await res.text()).slice(0, 200); } catch(_) {}
       throw new Error(`HTTP ${res.status} ${res.statusText}${bodySnippet ? ' — ' + bodySnippet : ''}`);
@@ -279,9 +301,16 @@ async function poll(){
     const data = await res.json();
     const ac = data.ac || [];
 
+    // Success: clear the error streak and drop back to the base poll rate.
+    if (consecutiveErrors > 0) {
+      logLine(`feed recovered after ${consecutiveErrors} failed poll(s), back to ${POLL_MS/1000}s interval`, false, null);
+    }
     consecutiveErrors = 0;
+    currentPollDelay = POLL_MS;
+
     statFeed.textContent = 'ok';
     statFeed.className = 'value';
+    statFeedSub.textContent = '';
     statTime.textContent = new Date().toLocaleTimeString();
     statTotal.textContent = ac.length;
 
@@ -304,28 +333,43 @@ async function poll(){
 
   }catch(err){
     consecutiveErrors++;
+
+    // Exponential backoff: 8s, 16s, 32s, 64s, then capped at 120s.
+    currentPollDelay = Math.min(MAX_POLL_MS, POLL_MS * Math.pow(BACKOFF_MULTIPLIER, consecutiveErrors));
+
     statFeed.textContent = 'error';
     statFeed.className = 'value err';
+    statFeedSub.textContent = `retry in ${Math.round(currentPollDelay/1000)}s (${consecutiveErrors} in a row)`;
 
-    // TypeError from fetch() almost always means the request never reached
-    // the server at all: CORS block, DNS failure, offline, or an ad-blocker/
-    // privacy extension eating the request. A "HTTP xxx" error (thrown above)
-    // means the server responded but rejected the request.
-    let reason;
+    // A TypeError from fetch() means the request never yielded a readable
+    // response: CORS block, DNS failure, offline, or an ad-blocker eating it.
+    // On adsb.lol specifically, the single most common cause is being
+    // rate-limited (HTTP 429) — the server strips CORS headers on non-200
+    // responses, so a 429 shows up here as a generic network error instead
+    // of a status your code can inspect. That's indistinguishable from a
+    // true outage on our end, but a growing error streak on a feed that was
+    // working moments ago strongly points to rate limiting rather than
+    // being offline.
+    let reason, isRateLimitLikely;
     if (err instanceof TypeError) {
-      reason = 'Network/CORS failure — request never completed. Check: are you offline? ' +
-               'Is an ad-blocker or privacy extension active on this page? Open DevTools → ' +
-               'Network tab and look at the failed request to api.adsb.lol for the real reason.';
+      isRateLimitLikely = true;
+      reason = 'Request blocked before a response could be read (TypeError). On adsb.lol this most often means ' +
+        'you are being rate-limited (HTTP 429) — the server only sends CORS headers on successful responses, so ' +
+        'a 429 looks identical to a CORS/offline failure from inside JS. Check DevTools → Network tab: if the ' +
+        'failed request to api.adsb.lol shows status 429, that confirms it. Could also be offline, DNS failure, ' +
+        'or an ad-blocker/privacy extension — check those if this persists after backing off. ' +
+        `Backing off to ${Math.round(currentPollDelay/1000)}s before the next attempt.`;
     } else {
-      reason = err.message;
+      isRateLimitLikely = /429|too many/i.test(err.message);
+      reason = err.message + ` — backing off to ${Math.round(currentPollDelay/1000)}s before the next attempt.`;
     }
 
-    logLine('feed error: ' + reason, true, true);
+    logLine('feed error: ' + reason, true, isRateLimitLikely ? 'rate' : 'err');
 
     if (consecutiveErrors >= 3) {
       banner.classList.add('info');
       banner.style.display = 'block';
-      bannerText.textContent = 'FEED ERROR';
+      bannerText.textContent = isRateLimitLikely ? 'FEED ERROR — LIKELY RATE-LIMITED (429)' : 'FEED ERROR';
       bannerDetail.textContent = reason;
     }
   }
@@ -367,7 +411,7 @@ function handleAlerting(matches){
 
   for(const a of newOnes){
     const label = `${(a.flight||a.r||a.hex).trim()} — ${a.desc||a.t||'unknown type'} — ${a._alt}ft`;
-    logLine(label, true, false);
+    logLine(label, true, null);
     fireNotification('Traffic near you', label);
   }
 
@@ -394,8 +438,10 @@ el('btn-mute').addEventListener('click', ()=>{
 el('btn-stop').addEventListener('click', ()=>{
   watching = false;
   stopAlarm();
+  clearTimeout(pollTimer);
   statFeed.textContent = 'stopped';
-  logLine('watch stopped by user', false, false);
+  statFeedSub.textContent = '';
+  logLine('watch stopped by user', false, null);
 });
 el('btn-apply-coords').addEventListener('click', ()=>{
   const newLat = parseFloat(el('input-lat').value);
@@ -410,12 +456,23 @@ el('btn-apply-coords').addEventListener('click', ()=>{
   el('coords-display').textContent = `${LAT.toFixed(6)}, ${LON.toFixed(6)}`;
   knownMatchHexes = new Set();
   consecutiveErrors = 0;
-  logLine(`location changed to ${LAT.toFixed(5)}, ${LON.toFixed(5)}`, false, false);
-  poll();
+  currentPollDelay = POLL_MS;
+  logLine(`location changed to ${LAT.toFixed(5)}, ${LON.toFixed(5)}`, false, null);
+  clearTimeout(pollTimer);
+  runLoop();
 });
 
-poll();
-setInterval(poll, POLL_MS);
+// Self-scheduling loop (replaces a fixed setInterval) so the delay between
+// polls can grow when we're being rate-limited and shrink back down once
+// the feed is healthy again.
+async function runLoop(){
+  if(!watching) return;
+  await poll();
+  if(!watching) return;
+  pollTimer = setTimeout(runLoop, currentPollDelay);
+}
+
+runLoop();
 </script>
 </body>
 </html>
