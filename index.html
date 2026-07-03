@@ -38,6 +38,8 @@
   #banner{display:none;background:var(--red);color:#1a0000;padding:18px 20px;margin-bottom:16px;
     font-size:15px;font-weight:700;letter-spacing:.03em;text-align:center;
     animation:flash 0.9s steps(2) infinite;border:1px solid #ff8080;}
+  #banner.info{display:block;background:var(--panel);color:var(--amber);border:1px solid #7a5a1f;
+    animation:none;text-align:left;font-weight:400;font-size:12px;}
   #banner .detail{display:block;font-weight:400;font-size:12px;margin-top:6px;font-family:var(--mono);}
   @keyframes flash{50%{background:#4a0000;color:var(--red);}}
 
@@ -63,6 +65,7 @@
   #log{font-size:11px;color:var(--text-dim);max-height:180px;overflow-y:auto;}
   #log div{padding:3px 0;border-bottom:1px solid var(--line);}
   #log div b{color:var(--amber);}
+  #log div.err b{color:var(--red);}
 
   footer{margin-top:24px;font-size:10px;color:var(--text-dim);line-height:1.7;border-top:1px solid var(--line);padding-top:12px;}
 </style>
@@ -77,7 +80,7 @@
     </div>
     <div class="coords">
       <div><b id="coords-display">42.216748, -70.739083</b></div>
-      <div>radius 1.85 nm · alt &lt; 4500 ft</div>
+      <div>radius <span id="radius-display">2</span> nm · alt &lt; 4500 ft</div>
     </div>
   </header>
 
@@ -126,11 +129,16 @@
 <script>
 let LAT = 42.21674795767772;
 let LON = -70.7390828673531;
-const RADIUS_NM = 1.85;
+
+// FIX: adsb.lol's /v2/point endpoint expects an integer nautical-mile radius.
+// A fractional value like 1.85 gets rejected by the API before it even looks
+// at your coordinates, which is the most likely cause of the constant errors.
+// Keep this a whole number (1-250).
+let RADIUS_NM = 2;
+
 const MAX_ALT_FT = 4500;
 const POLL_MS = 8000;
 
-// UPDATED: now rings 3 times per alert
 const RING_COUNT = 3;
 const RING_GAP_MS = 1400;
 
@@ -156,7 +164,10 @@ function isAirlinerBody(a){
 }
 
 function apiUrl(){
-  return `https://api.adsb.lol/v2/point/${LAT}/${LON}/${RADIUS_NM}`;
+  // Math.round() as a belt-and-suspenders guard in case RADIUS_NM ever
+  // gets set to a float again via the coords form or future edits.
+  const r = Math.max(1, Math.round(RADIUS_NM));
+  return `https://api.adsb.lol/v2/point/${LAT}/${LON}/${r}`;
 }
 
 let audioCtx = null;
@@ -164,11 +175,14 @@ let alarmTimer = null;
 let muted = false;
 let watching = true;
 let knownMatchHexes = new Set();
+let consecutiveErrors = 0;
 
 const el = id => document.getElementById(id);
 const statFeed = el('stat-feed'), statTime = el('stat-time'), statTotal = el('stat-total'),
       statMatch = el('stat-match'), banner = el('banner'), bannerText = el('banner-text'),
       bannerDetail = el('banner-detail'), tbody = el('table-body'), log = el('log');
+
+el('radius-display').textContent = Math.max(1, Math.round(RADIUS_NM));
 
 function haversineNm(lat1, lon1, lat2, lon2){
   const R = 3440.065;
@@ -178,9 +192,10 @@ function haversineNm(lat1, lon1, lat2, lon2){
   return R * 2 * Math.atan2(Math.sqrt(1-a), Math.sqrt(a));
 }
 
-function logLine(text, strong){
+function logLine(text, strong, isError){
   const t = new Date().toLocaleTimeString();
   const div = document.createElement('div');
+  if (isError) div.className = 'err';
   div.innerHTML = `${t} — ${strong ? '<b>'+text+'</b>' : text}`;
   log.prepend(div);
   while(log.children.length > 60) log.removeChild(log.lastChild);
@@ -246,11 +261,25 @@ function fireNotification(title, body){
 async function poll(){
   if(!watching) return;
   try{
-    const res = await fetch(apiUrl());
-    if(!res.ok) throw new Error('HTTP '+res.status);
+    const res = await fetch(apiUrl(), {
+      method: 'GET',
+      mode: 'cors',
+      headers: { 'Accept': 'application/json' }
+    });
+
+    if(!res.ok){
+      // Surface the actual HTTP status + body instead of a generic error,
+      // so a 422 (bad params), 429 (rate limited), or 5xx (server issue)
+      // are all distinguishable at a glance.
+      let bodySnippet = '';
+      try { bodySnippet = (await res.text()).slice(0, 200); } catch(_) {}
+      throw new Error(`HTTP ${res.status} ${res.statusText}${bodySnippet ? ' — ' + bodySnippet : ''}`);
+    }
+
     const data = await res.json();
     const ac = data.ac || [];
 
+    consecutiveErrors = 0;
     statFeed.textContent = 'ok';
     statFeed.className = 'value';
     statTime.textContent = new Date().toLocaleTimeString();
@@ -269,13 +298,36 @@ async function poll(){
     statMatch.textContent = matches.length;
     statMatch.className = matches.length ? 'value warn' : 'value';
 
+    banner.classList.remove('info');
     renderTable(matches);
     handleAlerting(matches);
 
   }catch(err){
+    consecutiveErrors++;
     statFeed.textContent = 'error';
     statFeed.className = 'value err';
-    logLine('feed error: '+err.message, false);
+
+    // TypeError from fetch() almost always means the request never reached
+    // the server at all: CORS block, DNS failure, offline, or an ad-blocker/
+    // privacy extension eating the request. A "HTTP xxx" error (thrown above)
+    // means the server responded but rejected the request.
+    let reason;
+    if (err instanceof TypeError) {
+      reason = 'Network/CORS failure — request never completed. Check: are you offline? ' +
+               'Is an ad-blocker or privacy extension active on this page? Open DevTools → ' +
+               'Network tab and look at the failed request to api.adsb.lol for the real reason.';
+    } else {
+      reason = err.message;
+    }
+
+    logLine('feed error: ' + reason, true, true);
+
+    if (consecutiveErrors >= 3) {
+      banner.classList.add('info');
+      banner.style.display = 'block';
+      bannerText.textContent = 'FEED ERROR';
+      bannerDetail.textContent = reason;
+    }
   }
 }
 
@@ -315,7 +367,7 @@ function handleAlerting(matches){
 
   for(const a of newOnes){
     const label = `${(a.flight||a.r||a.hex).trim()} — ${a.desc||a.t||'unknown type'} — ${a._alt}ft`;
-    logLine(label, true);
+    logLine(label, true, false);
     fireNotification('Traffic near you', label);
   }
 
@@ -343,7 +395,7 @@ el('btn-stop').addEventListener('click', ()=>{
   watching = false;
   stopAlarm();
   statFeed.textContent = 'stopped';
-  logLine('watch stopped by user', false);
+  logLine('watch stopped by user', false, false);
 });
 el('btn-apply-coords').addEventListener('click', ()=>{
   const newLat = parseFloat(el('input-lat').value);
@@ -357,7 +409,8 @@ el('btn-apply-coords').addEventListener('click', ()=>{
   LON = newLon;
   el('coords-display').textContent = `${LAT.toFixed(6)}, ${LON.toFixed(6)}`;
   knownMatchHexes = new Set();
-  logLine(`location changed to ${LAT.toFixed(5)}, ${LON.toFixed(5)}`, false);
+  consecutiveErrors = 0;
+  logLine(`location changed to ${LAT.toFixed(5)}, ${LON.toFixed(5)}`, false, false);
   poll();
 });
 
